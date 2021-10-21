@@ -1,0 +1,107 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+  schedule:
+    - cron:  '0 0 * * MON'
+
+jobs:
+  build:
+    runs-on: ubuntu-18.04
+
+    steps:
+      - uses: actions/checkout@v2
+
+      - name: Send Sonar Analysis Notification
+        run: |
+          sudo apt update -y
+          sudo apt install jq -y
+          sudo apt install ssmtp -y
+          sudo rm /etc/ssmtp/ssmtp.conf
+          sudo rm /etc/ssmtp/revaliases
+          sudo echo "root=${{secrets.MAIL_USERNAME}}
+          mailhub=smtp.gmail.com:587
+          hostname=Sonar_Analysis
+          UseSTARTTLS=yes
+          AuthUser=${{secrets.MAIL_USERNAME}}
+          AuthPass=${{secrets.MAIL_PASSWORD}}
+          UseTLS=yes
+          FromLineOverride=yes" > ssmtp.conf
+          sudo echo "root:${{secrets.MAIL_USERNAME}}:smtp.gmail.com:587" > revaliases
+          sudo cp ssmtp.conf /etc/ssmtp/ssmtp.conf
+          sudo cp revaliases /etc/ssmtp/revaliases
+
+          USERDATE=$(date +%s)
+          # Subtract 1 week
+          ((USERDATE -= (60*60*24*7) ))
+
+          # Convert from epoch seconds into YYYYMMDD.
+          DATE=$(date -d "@$USERDATE" +"%Y-%m-%d")
+          echo "One week previous was $DATE"
+
+          TODAYS_DATE=$(date +%d/%m/%y)
+
+          ALL_ANALYSIS_PROJECT=$(curl -u ${{secrets.TOKEN}}: ${{secrets.URL}}/api/projects/search | jq '.components[] | .key+"="+.name ')
+          OUTDATED_ANALYSIS_PROJECT=$(curl -u ${{secrets.TOKEN}}: ${{secrets.URL}}/api/projects/search?analyzedBefore=$DATE | jq '.components[] | .key+"="+.name ')
+          echo -n $OUTDATED_ANALYSIS_PROJECT | sed 's/"/\n/g' > OUTDATED_ANALYSIS_REPORT.txt
+          echo -n $ALL_ANALYSIS_PROJECT | sed 's/"/\n/g' > ALL_ANALYSIS_REPORT.txt
+
+          ARCHIVED_PROJECTS=$(curl -u ${{secrets.TOKEN}}: ${{secrets.URL}}/api/components/search_projects?filter=tags%20IN%20\(archive\) | jq '.components[] | .key+"="+.name')
+          echo -n $ARCHIVED_PROJECTS | sed 's/"/\n/g' > ARCHIVED_PROJECTS.txt
+          grep -vxFf ARCHIVED_PROJECTS.txt ALL_ANALYSIS_REPORT.txt | awk ' {print;} NR % 1 == 0 { print ""; }' > REMOVED_ARCHIVED_PROJECTS.txt
+          grep -vxFf OUTDATED_ANALYSIS_REPORT.txt REMOVED_ARCHIVED_PROJECTS.txt | awk ' {print;} NR % 1 == 0 { print ""; }' > UPTO_DATE_ANALYSIS.txt
+
+          while IFS='' read -r LINE || [ -n "${LINE}" ]; do
+            if [ "${LINE}" == " " ]; then
+              :
+            elif [ "${LINE}" == "" ]; then
+              :
+            else
+              key=$(echo $LINE | cut -f1 -d=)
+              name=$(echo $LINE | cut -f2 -d=)
+
+              STATUS=$(curl -u ${{secrets.TOKEN}}: ${{secrets.URL}}/api/qualitygates/project_status?projectKey=${key} | jq -r '.projectStatus | .status ')
+
+              if [ "${STATUS}" == "OK" ]; then
+                echo -e "$name" >> QUALITY_GATES_PASSED.txt
+              fi
+
+            fi
+          done < UPTO_DATE_ANALYSIS.txt
+
+          ALL_PROJECT=$(curl -u ${{secrets.TOKEN}}: ${{secrets.URL}}/api/components/search_projects | jq '.components[] | .name ')
+          echo -n $ALL_PROJECT | sed 's/"/\n/g' > ALL_PROJECT_REPORT.txt
+
+          ARCHIVED_PROJECT_NAMES=$(curl -u ${{secrets.TOKEN}}: ${{secrets.URL}}/api/components/search_projects?filter=tags%20IN%20\(archive\) | jq '.components[] | .name')
+          echo -n $ARCHIVED_PROJECT_NAMES | sed 's/"/\n/g' > ARCHIVED_PROJECT_NAMES.txt
+
+          grep -vxFf ARCHIVED_PROJECT_NAMES.txt ALL_PROJECT_REPORT.txt | awk ' {print;} NR % 1 == 0 { print ""; }' > REMOVED_ARCHIVED_PROJECTS.txt 
+          grep -vxFf QUALITY_GATES_PASSED.txt REMOVED_ARCHIVED_PROJECTS.txt | awk ' {print;} NR % 1 == 0 { print ""; }' | sed -r '/^\s*$/d' > QUALITY_GATES_FAILED.txt
+          
+          echo "To: Sonar<${{secrets.EMAIL}}>
+          Subject: SONAR ANALYSIS | WEEKLY REPORT | $TODAYS_DATE
+          From: Sonar <support@sonar.com>
+          Content-Type: text/html; charset="utf8"
+          <html>
+          <head>
+          </head>
+          <body>
+          <H1> Sonar Projects Passed Quality Checks: </H1>
+          <div style='background-color:green; width: 500px;height: 10px;'> </div>
+          <h4>The following project's analysis has passed quality checks:</h3>
+          <pre style='color:green;font-size:12px;font-weight:bold'>
+          `cat QUALITY_GATES_PASSED.txt`
+          </pre>
+          <br>
+          <H1> Sonar Projects Failed Quality Checks : </H1>
+          <div style='background-color:red; width: 500px;height: 10px;'> </div>
+          <h4>The following project's analysis has falied quality checks:</h3>
+          <pre style='color:red;font-size:12px;font-weight:bold'>
+          `cat QUALITY_GATES_FAILED.txt`
+          </pre>
+          </body>
+          </html>" > mail.txt
+          sendmail ${{secrets.EMAIL}} < mail.txt
+          rm QUALITY_GATES_PASSED.txt UPTO_DATE_ANALYSIS.txt QUALITY_GATES_FAILED.txt ARCHIVED_PROJECTS.txt REMOVED_ARCHIVED_PROJECTS.txt
